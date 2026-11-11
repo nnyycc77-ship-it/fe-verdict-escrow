@@ -2,11 +2,11 @@
 
 What this file is: the points where Fe 26.6.0, the exact toolchain this repo builds with (`fe 26.6.0 (5b3f96a)`), surprised us while we built Verdict Escrow, each with the smallest reproduction we ran. The reproductions were first run in scratch ingots during the build and were run again when this file was written. Nothing here blocks the contract. Two of the three findings shaped its design, and the README limitations carry the consequences a user of the contract feels.
 
-## 1. A contract compiled with this toolchain cannot receive a plain transfer
+## 1. We could not make a contract receive a plain transfer
 
 What we saw. A claim that pays a deployed Fe contract reverts with the message "Payout failed", even with 100,000 gas forwarded to the send. The same flow pays a codeless address without trouble, and the rest of the suite, with claims to fresh addresses throughout, proves the send itself is sound.
 
-Why it happens. Every runtime compiled in our sessions opens with a calldata size guard that routes empty calldata into the selector dispatch, where the zero word matches no selector and the call reverts. A plain transfer carries empty calldata, so it never reaches any code that could accept it. The compiled output has no entry point that answers a call carrying no selector.
+Why it happens. Every runtime compiled in our sessions opens with a calldata size guard that routes empty calldata into the selector dispatch, where the zero word matches no selector and the call reverts. A plain transfer carries empty calldata, so it never reaches any code that could accept it. That is as far as our evidence goes: every contract we compiled behaved this way, and we found no documented way to declare a handler for empty calldata.
 
 Smallest reproduction. Two tiny contracts in a scratch ingot: a sink that does nothing but answer one message, and a sender that forwards what it receives with `send_value` at 100,000 gas, asserting on success exactly the way `Claim` does.
 
@@ -109,7 +109,7 @@ What it means for this contract. Claims pay plain addresses. A payee contract in
 
 ## 2. A typed call made with gas 0 never executes
 
-What we saw. A typed contract to contract call (`call.call` with a message) made with `gas: 0` and no value does not run the callee at all: with no value there is no transfer stipend, so the callee is granted no gas. The caller then panics on the missing return data; in the build session the failure surfaced as the standard library panic payload `Panic(1)`. The starter vault's inner calls use `gas: 0` as well, but only for calls whose returns are defaulted, which masks the same behavior.
+What we saw. A typed contract to contract call (`call.call` with a message) made with `gas: 0` and no value does not run the callee at all: with no value there is no transfer stipend, so the callee is granted no gas. The caller then panics on the missing return data; in the build session the failure surfaced as the standard library panic payload `Panic(1)`.
 
 Smallest reproduction. One caller contract with two handlers that differ only in the gas argument, calling the sink from the first entry, and one test per handler:
 
@@ -187,7 +187,9 @@ What we saw. The standard library source embedded in the toolchain binary shows 
 
 How we checked. We built the scratch sender from the first entry twice, once with `gas: 100000` and once with `gas: 2300`, and read the constants out of the compiled runtime. The first build carries the constant `0x186a0` (100,000) and no 2,300 constant; the second carries `0x08fc` (2,300) and no 100,000 constant. The argument in the source is the argument in the bytecode, unchanged.
 
-What it means for this contract. The first version of `Claim` sent with a gas argument of 0 and so paid with the bare stipend only, which a receiver doing any work at all would exceed. `Claim` now forwards 100,000 gas explicitly. That is safe here because the paid flag is set before the send and `Claim` is the only handler that moves value.
+What it means for this contract. The first version of `Claim` sent with a gas argument of 0 and so paid with the bare stipend only, which a receiver doing any work at all would exceed. `Claim` now forwards 100,000 gas explicitly. We chose a fixed figure rather than passing the available gas: a bounded budget for the receiver, enough for a receive path that does real work, stated in the code where a reader can see it. That is safe here because the paid flag is set before the send and `Claim` is the only handler that moves value.
+
+One observation from the organisers' own starter vault, read at its current commit: its `Withdraw` handler sends with `send_value` at a gas argument of 0, so it pays with the bare stipend only. Our first `Claim` took the same value from the same pattern. We record it as an observation, not a criticism; the starter is a teaching template, and the fact is worth knowing for anyone who starts from it.
 
 ## Smaller notes
 

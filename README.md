@@ -20,10 +20,10 @@ Every verdict is counted in a per job sequence that only increases, and each ver
 The point of this entry is how the release logic reads in Fe, and three language properties carry it:
 
 - **Explicit effects.** Every handler declares exactly what it may touch. Reading the signatures is most of the audit: `Verdict` declares storage writes and the log, but no `Call` effect, so a verdict can change who is entitled and can never itself move money. In `VerdictEscrow`, only `Claim` declares the `Call` effect, and it is the only handler that sends value.
-- **Least privilege, stated exactly.** Storage is split into three maps by privilege, and the compiler enforces the split through the effect lists. The entitlement map is written only by the `Verdict` and `ReclaimTimeout` handlers, the only two handlers that declare it mutable, so a settlement is written only where a settlement is decided. The paid flag lives in its own map, written only by `Claim`, and `Claim` declares the core record and the entitlement map read only, so the claim cannot change a verdict: it can read who is entitled, check the amount, and collect, and nothing more. Only `Claim` can send value, and the read only views cannot write at all. What the compiler does not check is role separation (the worker cannot judge, the evaluator cannot deliver); that stays with caller checks inside the handlers, which are ordinary asserts that the tests exercise.
+- **Least privilege, stated exactly.** Storage is split into three maps by privilege, and the compiler enforces the split through the effect lists. The entitlement map is written only by the `Verdict` and `ReclaimTimeout` handlers, the only two handlers that declare it mutable, so a settlement is written only where a settlement is decided. The paid flag lives in its own map, written only by `Claim`, and `Claim` declares the core record and the entitlement map read only, so the claim cannot change a verdict: it can read who is entitled, check the amount, and collect, and nothing more. Only `Claim` can send value, and the read only views cannot write at all. What the compiler does not check is role separation and the order of states. Role separation (the worker cannot judge, the evaluator cannot deliver) stays with caller checks inside the handlers. The order of states stays with the state asserts: `Create` and `Deliver` hold write access to the core record, which carries the state field, so a settled job staying settled is held by those asserts, not by the compiler. Both are ordinary asserts that the tests exercise.
 - **Solidity compatible ABI.** Message selectors are computed at compile time with the `sol(...)` helper, and `fe build` emits deploy bytecode, runtime bytecode, and a Solidity compatible ABI JSON, so the contract drops into existing EVM tooling, while the source stays in Fe's effect discipline.
 
-## A negative proof you can run
+## Negative proofs you can run
 
 The strongest claim above is that a verdict can never move money, because the `Verdict` handler declares no `Call` effect. You do not have to take this README at its word. In a scratch copy of this repo, add these four lines to the settling branch of the `Verdict` handler in `src/lib.fe`, right after the entitlement is written:
 
@@ -45,6 +45,27 @@ error[8-0012]: undefined variable
 ```
 
 The `call` capability is simply not in scope inside a handler that does not declare it, so the send cannot be smuggled in. The only way to make that line compile is to add `mut call` to the `Verdict` handler's own `uses` list, in the signature, where any reader can see it. The shipped tree contains no such line and no such declaration; the scratch copy is the whole experiment, and deleting it restores the build.
+
+The storage split carries the matching proof, for the round's other central claim: the claim cannot change a verdict. In a scratch copy of this repo, add this one line to the `Claim` handler in `src/lib.fe`, right after the paid flag is written:
+
+```fe
+entitlements.set(key: job_id, value: to)
+```
+
+Then run `fe build`. The compiler refuses, with exit code 1:
+
+```
+error[8-0066]: mutable borrow requires a mutable place
+    ┌─ src/lib.fe:304:13
+    │
+291 │             entitlements,
+    │             ------------ `entitlements` does not provide mutable access
+    ·
+304 │             entitlements.set(key: job_id, value: to)
+    │             ^^^^^^^^^^^^ cannot borrow as `mut`
+```
+
+`Claim` declares the entitlement map without `mut`, so the write cannot borrow it as mutable. The only way to make that line compile is to declare the map mutable in the `Claim` signature, in the open, where the effect list states it. The shipped tree declares it read only there; again the scratch copy is the whole experiment, and deleting it restores the build.
 
 ## Architecture
 
@@ -90,5 +111,5 @@ The test suite is also the demo: it walks the complete life of several jobs end 
 
 - **Preexisting work.** The escrow and verdict design comes from our own earlier design work in other stacks: a NEAR testnet escrow gate demo and a written verdict layer design for agent work (the Trust Toll research line), both from October and November 2026. Those designs are ideas and research, in other languages; no code from them is reused here. The starter project's time locked vault, published by the contest organisers as a template, was used as a syntax reference for Fe idioms.
 - **Written inside the window.** All Fe code, tests, and documentation in this repository were written during the contest build window, 2026-11-03 to 2026-11-24.
-- **AI assistance.** This project was built with AI assistance, as the contest expressly welcomes: an AI assistant drafted the contract, the tests, and this documentation under the direction of the human contact. A second, independent AI reviewer read every line, and its findings were applied in the fix round recorded in the commit history. The build and the full test suite run on each push in the repository's own workflow. Every claim in this README was rechecked against the final code, and the full suite was run green (`fe build` exit 0, `fe test` 19 passed and 0 failed) before the entry was submitted. The assistance is disclosed here and in the entry registration; a human contact is responsible for the entry and can explain the code.
+- **AI assistance.** This project was built with AI assistance, as the contest expressly welcomes: an AI assistant drafted the contract, the tests, and this documentation under the direction of the human contact. A second, independent AI reviewer read every line, and its findings were applied in the fix rounds recorded in the commit history. The build and the full test suite run on each push in the repository's own workflow. Every claim in this README was rechecked against the final code, and the full suite was run green (`fe build` exit 0, `fe test` 20 passed and 0 failed) before the entry was submitted. The assistance is disclosed here and in the entry registration; a human contact is responsible for the entry and can explain the code.
 - **License.** MIT, see `LICENSE`.
