@@ -19,7 +19,7 @@ Every verdict is counted in a per job sequence that only increases, and each ver
 
 The point of this entry is how the release logic reads in Fe, and three language properties carry it:
 
-- **Explicit effects.** Every handler declares exactly what it may touch. Reading the signatures is most of the audit: `Verdict` declares storage writes and the log, but no `Call` effect, so a verdict can change who is entitled and can never itself move money. Only `Claim` declares the `Call` effect, and it is the only handler that sends value.
+- **Explicit effects.** Every handler declares exactly what it may touch. Reading the signatures is most of the audit: `Verdict` declares storage writes and the log, but no `Call` effect, so a verdict can change who is entitled and can never itself move money. In `VerdictEscrow`, only `Claim` declares the `Call` effect, and it is the only handler that sends value.
 - **Least privilege, stated exactly.** What the compiler enforces is the effect lists: only the `Claim` handler can send value, and the read only views cannot write. Role separation (the worker cannot judge, the evaluator cannot deliver) is enforced by caller checks inside the handlers, not by the compiler, because every writing handler holds write access to the whole jobs map. The effect lists are compiler checked; the caller checks are ordinary asserts that the tests exercise.
 - **Solidity compatible ABI.** Message selectors are computed at compile time with the `sol(...)` helper, and `fe build` emits deploy bytecode, runtime bytecode, and a Solidity compatible ABI JSON, so the contract drops into existing EVM tooling, while the source stays in Fe's effect discipline.
 
@@ -38,7 +38,7 @@ One contract, `VerdictEscrow` in `src/lib.fe`, one ingot, no dependencies. The s
 Exact toolchain: **Fe 26.6.0** (`fe 26.6.0 (5b3f96a)`). Get the exact release from the Fe project's GitHub releases page (github.com/argotorg/fe, release 26.6.0, published 2026-11-10): download the Linux x86_64 binary `fe_linux_amd64` (55,932,656 bytes, SHA 256 697081cb9265bd1be7a5d33e6bb0c8559ee5ff542abab9a046540fc151b4edaa), verify the checksum, and put the binary on your path as `fe`.
 
 ```sh
-fe build   # writes out/VerdictEscrow.bin, out/VerdictEscrow.runtime.bin, out/VerdictEscrow.abi.json
+fe build   # writes out/VerdictEscrow.bin, out/VerdictEscrow.runtime.bin, out/VerdictEscrow.abi.json, and the same three outputs for PosterProxy
 fe test    # runs the suite in src/tests.fe against the integrated EVM simulation
 fe fmt     # the sources are formatted with fe fmt
 ```
@@ -66,5 +66,5 @@ The test suite is also the demo: it walks the complete life of several jobs end 
 
 - **Preexisting work.** The escrow and verdict design comes from our own earlier design work in other stacks: a NEAR testnet escrow gate demo and a written verdict layer design for agent work (the Trust Toll research line), both from October and November 2026. Those designs are ideas and research, in other languages; no code from them is reused here. The starter project's time locked vault, published by the contest organisers as a template, was used as a syntax reference for Fe idioms.
 - **Written inside the window.** All Fe code, tests, and documentation in this repository were written during the contest build window, 2026-11-03 to 2026-11-24.
-- **AI assistance.** This project was built with AI assistance, as the contest expressly welcomes: an AI assistant drafted the contract, the tests, and this documentation from a human written design brief, and a human reviewer checked the drafts line by line. Every claim in this README was rechecked against the final code, and the full suite was run green (`fe build` exit 0, `fe test` 19 passed and 0 failed) before the entry was submitted. The assistance is disclosed here and in the entry registration; a human contact is responsible for the entry and can explain the code.
+- **AI assistance.** This project was built with AI assistance, as the contest expressly welcomes: an AI assistant drafted the contract, the tests, and this documentation under the direction of the human contact. A second, independent AI reviewer read every line, and its findings were applied in the fix round recorded in the commit history. The build and the full test suite run on each push in the repository's own workflow. Every claim in this README was rechecked against the final code, and the full suite was run green (`fe build` exit 0, `fe test` 19 passed and 0 failed) before the entry was submitted. The assistance is disclosed here and in the entry registration; a human contact is responsible for the entry and can explain the code.
 - **License.** MIT, see `LICENSE`.

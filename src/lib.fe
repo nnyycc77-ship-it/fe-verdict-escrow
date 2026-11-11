@@ -317,6 +317,8 @@ msg PosterProxyMsg {
 // that delivers the work and records the verdicts. Its calls into the
 // escrow are typed message calls; on this toolchain a typed call made
 // with gas 0 never executes, so the inner calls carry explicit gas.
+// It is a test helper only and is not for deployment: it has no access
+// control, and any caller can use it.
 pub contract PosterProxy uses (ctx: Ctx, call: mut Call) {
     recv PosterProxyMsg {
         #[payable]
