@@ -5,8 +5,11 @@
 // hash, the evaluator records a verdict bound to that hash, and the escrow
 // settles by rule: pass entitles the worker to the escrow, fail entitles
 // the poster to a refund, revise sends the job back for a new delivery and
-// a new verdict. If the evaluator stays silent past the verdict window
-// after a delivery, the poster can reclaim the entitlement. Whoever a
+// a new verdict. Every move restarts the job's clock: creation, each
+// delivery, and each revise verdict. Once the verdict window has passed
+// since the last move, the poster can reclaim the entitlement, which
+// covers a worker who never delivers, a worker who abandons the job after
+// a revise, and an evaluator who stays silent after a delivery. Whoever a
 // settlement entitles collects the funds with a claim, to an address of
 // their choice. Many jobs coexist in one deployment, each with its own
 // parties, amount, delivery hash and verdict sequence.
@@ -98,7 +101,9 @@ struct Claimed {
 // Everything the contract remembers about one job. The delivery hash is the
 // 256 bit digest of the delivery the worker stands behind; a verdict only
 // counts when it names this exact hash. verdict_seq counts the verdicts
-// recorded for the job and only ever increases. On settlement the verdict
+// recorded for the job and only ever increases. last_move_at is the time
+// of the job's last move (creation, a delivery, or a revise verdict) and
+// starts the clock for the poster's reclaim. On settlement the verdict
 // fixes payee, the one party entitled to the escrow; paid flips to 1 when
 // the payee has collected, and nothing else about the job can change after
 // settlement.
@@ -110,7 +115,7 @@ struct Job {
     delivery_hash: u256,
     state: u256,
     verdict_seq: u256,
-    delivered_at: Timestamp,
+    last_move_at: Timestamp,
     payee: Address,
     paid: u256,
 }
@@ -148,7 +153,7 @@ pub contract VerdictEscrow uses (ctx: Ctx, call: mut Call, log: mut Log) {
                     delivery_hash: 0,
                     state: STATE_OPEN,
                     verdict_seq: 0,
-                    delivered_at: ctx.timestamp(),
+                    last_move_at: ctx.timestamp(),
                     payee: Address::new(0),
                     paid: 0,
                 },
@@ -170,7 +175,7 @@ pub contract VerdictEscrow uses (ctx: Ctx, call: mut Call, log: mut Log) {
             assert!(delivery_hash != 0, "Delivery hash required")
 
             job.delivery_hash = delivery_hash
-            job.delivered_at = ctx.timestamp()
+            job.last_move_at = ctx.timestamp()
             job.state = STATE_DELIVERED
             jobs.set(key: job_id, value: job)
             log.emit(Delivered { job_id, delivery_hash })
@@ -207,6 +212,7 @@ pub contract VerdictEscrow uses (ctx: Ctx, call: mut Call, log: mut Log) {
 
             if kind == VERDICT_REVISE {
                 job.state = STATE_OPEN
+                job.last_move_at = ctx.timestamp()
                 jobs.set(key: job_id, value: job)
             } else {
                 let amount = job.amount
@@ -228,16 +234,23 @@ pub contract VerdictEscrow uses (ctx: Ctx, call: mut Call, log: mut Log) {
             seq
         }
 
-        // If no verdict arrives within the verdict window after a delivery,
-        // the poster can reclaim the escrow: the job settles with the poster
-        // as the entitled party, and the poster collects with Claim. Only
-        // the poster, only while a delivery is still waiting for a verdict.
+        // Once the verdict window has passed since the job's last move
+        // (creation, a delivery, or a revise verdict) without the job
+        // settling, the poster can reclaim the escrow: the job settles
+        // with the poster as the entitled party, and the poster collects
+        // with Claim. Only the poster, and only while the job is still
+        // unsettled, so every round carries its own deadline: a worker
+        // who never delivers, a worker who abandons after a revise, and
+        // an evaluator who stays silent all leave the poster this exit.
         ReclaimTimeout { job_id } -> Wei uses (ctx, verdict_timeout, mut jobs, mut log) {
             var job = jobs.get(key: job_id)
-            assert!(job.state == STATE_DELIVERED, "Job has no live delivery")
+            assert!(
+                job.state == STATE_OPEN || job.state == STATE_DELIVERED,
+                "Job is already settled",
+            )
             assert!(ctx.caller() == job.poster, "Only the poster can reclaim")
             assert!(
-                ctx.timestamp() >= job.delivered_at + verdict_timeout,
+                ctx.timestamp() >= job.last_move_at + verdict_timeout,
                 "Verdict window still open",
             )
 
@@ -254,7 +267,9 @@ pub contract VerdictEscrow uses (ctx: Ctx, call: mut Call, log: mut Log) {
         // The party a settlement named as payee collects the escrow, to an
         // address of their choice. This is the only handler that moves
         // funds, and the job is marked paid before the send, so a reentrant
-        // call finds nothing left to claim.
+        // call finds nothing left to claim. The send forwards 100,000 gas,
+        // well beyond the bare transfer stipend, so a contract payee whose
+        // receive path does work can still be paid.
         Claim { job_id, to } -> Wei uses (ctx, mut call, mut jobs, mut log) {
             var job = jobs.get(key: job_id)
             assert!(job.state == STATE_SETTLED, "Job is not settled")
@@ -265,7 +280,7 @@ pub contract VerdictEscrow uses (ctx: Ctx, call: mut Call, log: mut Log) {
             job.paid = 1
             jobs.set(key: job_id, value: job)
             assert!(
-                call.send_value(addr: to, gas: 0, value: amount).success(),
+                call.send_value(addr: to, gas: 100000, value: amount).success(),
                 "Payout failed",
             )
             log.emit(Claimed { job_id, to, amount })
@@ -286,6 +301,45 @@ pub contract VerdictEscrow uses (ctx: Ctx, call: mut Call, log: mut Log) {
 
         VerdictSeqOf { job_id } -> u256 uses (jobs) {
             jobs.get(key: job_id).verdict_seq
+        }
+    }
+}
+
+msg PosterProxyMsg {
+    #[selector = sol("createJobAsPoster(address,address,address)")]
+    CreateJobAsPoster { escrow: Address, worker: Address, evaluator: Address } -> u256,
+    #[selector = sol("claimAsPoster(address,uint256,address)")]
+    ClaimAsPoster { escrow: Address, job_id: u256, to: Address } -> Wei,
+}
+
+// Test helper: a forwarding contract the test deploys so that the poster
+// of a job is this contract's address, different from the test account
+// that delivers the work and records the verdicts. Its calls into the
+// escrow are typed message calls; on this toolchain a typed call made
+// with gas 0 never executes, so the inner calls carry explicit gas.
+pub contract PosterProxy uses (ctx: Ctx, call: mut Call) {
+    recv PosterProxyMsg {
+        #[payable]
+        CreateJobAsPoster { escrow, worker, evaluator } -> u256
+        uses (ctx, mut call)
+        {
+            call.call(
+                addr: escrow,
+                gas: 500000,
+                value: ctx.value(),
+                message: VerdictEscrowMsg::CreateJob { worker, evaluator },
+            )
+        }
+
+        ClaimAsPoster { escrow, job_id, to } -> Wei
+        uses (mut call)
+        {
+            call.call(
+                addr: escrow,
+                gas: 500000,
+                value: Wei::zero(),
+                message: VerdictEscrowMsg::Claim { job_id, to },
+            )
         }
     }
 }

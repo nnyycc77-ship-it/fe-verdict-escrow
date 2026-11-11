@@ -4,14 +4,17 @@
 // happy path tests the test account plays poster, worker and evaluator at
 // once. Settlements are collected with Claim to a fresh address, and the
 // payout is checked there and in the contract balance. Role separation is
-// covered by the revert tests, where the job names a different worker or
-// evaluator and the test account's call must fail the guard.
+// covered two ways: the revert tests, where the job names a different
+// worker or evaluator and the test account's call must fail the guard, and
+// the proxy tests near the end, where a forwarding contract creates the
+// job so the poster is a different address from the test account that
+// delivers and judges, and each side's claim rights are checked apart.
 //
 // Verdict kinds: 1 is pass, 2 is revise, 3 is fail.
 // Job states: 1 is open for delivery, 2 is delivered, 3 is settled.
 
-use ingot::{VerdictEscrow, VerdictEscrowMsg}
-use std::evm::{days, ether}
+use ingot::{PosterProxy, PosterProxyMsg, VerdictEscrow, VerdictEscrowMsg}
+use std::evm::{days, ether, seconds}
 
 #[test(balance = 10_000_000_000_000_000_000)]
 fn pass_releases_to_worker() uses (evm: mut Evm) {
@@ -551,4 +554,284 @@ fn jobs_are_independent() uses (evm: mut Evm) {
         )
     assert!(seq_b == 0)
     assert!(evm.balance(escrow) == ether(2))
+}
+
+// With a zero verdict window, a job that was never delivered can be
+// reclaimed straight from the open state.
+#[test(balance = 10_000_000_000_000_000_000)]
+fn reclaim_undelivered_job_succeeds() uses (evm: mut Evm) {
+    let me = evm.address()
+    let escrow = evm.create2<VerdictEscrow>(value: Wei::zero(), args: (seconds(0),), salt: 0)
+
+    let job: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: ether(1),
+            message: VerdictEscrowMsg::CreateJob { worker: me, evaluator: me },
+        )
+    let reclaimed: Wei = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::ReclaimTimeout { job_id: job },
+        )
+    assert!(reclaimed == ether(1))
+    let payee = Address::new(0xCAFE)
+    let claimed: Wei = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Claim { job_id: job, to: payee },
+        )
+    assert!(claimed == ether(1))
+    assert!(evm.balance(payee) == ether(1))
+    assert!(evm.balance(escrow) == Wei::zero())
+}
+
+// With a long window, reclaiming a job that was never delivered reverts
+// while the window is still open.
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn reclaim_undelivered_before_window_reverts() uses (evm: mut Evm) {
+    let me = evm.address()
+    let escrow = evm.create2<VerdictEscrow>(value: Wei::zero(), args: (days(7),), salt: 0)
+
+    let job: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: ether(1),
+            message: VerdictEscrowMsg::CreateJob { worker: me, evaluator: me },
+        )
+    let _: Wei = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::ReclaimTimeout { job_id: job },
+        )
+}
+
+// A revise restarts the job's clock: with a zero window the poster can
+// reclaim a job the worker abandoned after the revise.
+#[test(balance = 10_000_000_000_000_000_000)]
+fn reclaim_abandoned_after_revise_succeeds() uses (evm: mut Evm) {
+    let me = evm.address()
+    let escrow = evm.create2<VerdictEscrow>(value: Wei::zero(), args: (seconds(0),), salt: 0)
+
+    let job: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: ether(1),
+            message: VerdictEscrowMsg::CreateJob { worker: me, evaluator: me },
+        )
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Deliver { job_id: job, delivery_hash: 111 },
+        )
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Verdict { job_id: job, kind: 2, delivery_hash: 111 },
+        )
+    // The worker never delivers again. The poster reclaims from the open
+    // state the revise left the job in.
+    let reclaimed: Wei = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::ReclaimTimeout { job_id: job },
+        )
+    assert!(reclaimed == ether(1))
+    let payee = Address::new(0xCAFE)
+    let claimed: Wei = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Claim { job_id: job, to: payee },
+        )
+    assert!(claimed == ether(1))
+    assert!(evm.balance(payee) == ether(1))
+    assert!(evm.balance(escrow) == Wei::zero())
+}
+
+// The proxy contract creates and funds the job, so the poster is a
+// different address from the test account that delivers and judges. On a
+// pass the worker (the test account) collects; the settlement names the
+// worker, not the poster who funded the job.
+#[test(balance = 10_000_000_000_000_000_000)]
+fn proxy_pass_pays_worker_not_poster() uses (evm: mut Evm) {
+    let me = evm.address()
+    let escrow = evm.create2<VerdictEscrow>(value: Wei::zero(), args: (days(7),), salt: 0)
+    let proxy = evm.create2<PosterProxy>(value: Wei::zero(), args: (), salt: 0)
+
+    let job: u256 = evm
+        .call(
+            addr: proxy,
+            gas: 900000,
+            value: ether(1),
+            message: PosterProxyMsg::CreateJobAsPoster { escrow, worker: me, evaluator: me },
+        )
+    assert!(job == 1)
+    assert!(evm.balance(escrow) == ether(1))
+    assert!(evm.balance(me) == ether(9))
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Deliver { job_id: job, delivery_hash: 111 },
+        )
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Verdict { job_id: job, kind: 1, delivery_hash: 111 },
+        )
+    let payee = Address::new(0xCAFE)
+    let claimed: Wei = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Claim { job_id: job, to: payee },
+        )
+    assert!(claimed == ether(1))
+    assert!(evm.balance(payee) == ether(1))
+    assert!(evm.balance(escrow) == Wei::zero())
+}
+
+// Same proxy setup on a pass: the poster proxy itself tries to claim and
+// the payee guard rejects it, because the pass entitled the worker.
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn proxy_poster_claim_on_pass_reverts() uses (evm: mut Evm) {
+    let me = evm.address()
+    let escrow = evm.create2<VerdictEscrow>(value: Wei::zero(), args: (days(7),), salt: 0)
+    let proxy = evm.create2<PosterProxy>(value: Wei::zero(), args: (), salt: 0)
+
+    let job: u256 = evm
+        .call(
+            addr: proxy,
+            gas: 900000,
+            value: ether(1),
+            message: PosterProxyMsg::CreateJobAsPoster { escrow, worker: me, evaluator: me },
+        )
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Deliver { job_id: job, delivery_hash: 111 },
+        )
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Verdict { job_id: job, kind: 1, delivery_hash: 111 },
+        )
+    let _: Wei = evm
+        .call(
+            addr: proxy,
+            gas: 900000,
+            value: Wei::zero(),
+            message: PosterProxyMsg::ClaimAsPoster {
+                escrow,
+                job_id: job,
+                to: Address::new(0xBEEF),
+            },
+        )
+}
+
+// On a fail the poster is entitled, and the proxy collects the refund to
+// an address of its choice.
+#[test(balance = 10_000_000_000_000_000_000)]
+fn proxy_fail_refunds_poster_not_worker() uses (evm: mut Evm) {
+    let me = evm.address()
+    let escrow = evm.create2<VerdictEscrow>(value: Wei::zero(), args: (days(7),), salt: 0)
+    let proxy = evm.create2<PosterProxy>(value: Wei::zero(), args: (), salt: 0)
+
+    let job: u256 = evm
+        .call(
+            addr: proxy,
+            gas: 900000,
+            value: ether(2),
+            message: PosterProxyMsg::CreateJobAsPoster { escrow, worker: me, evaluator: me },
+        )
+    assert!(job == 1)
+    assert!(evm.balance(me) == ether(8))
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Deliver { job_id: job, delivery_hash: 222 },
+        )
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Verdict { job_id: job, kind: 3, delivery_hash: 222 },
+        )
+    let refund_spot = Address::new(0xBEEF)
+    let refunded: Wei = evm
+        .call(
+            addr: proxy,
+            gas: 900000,
+            value: Wei::zero(),
+            message: PosterProxyMsg::ClaimAsPoster { escrow, job_id: job, to: refund_spot },
+        )
+    assert!(refunded == ether(2))
+    assert!(evm.balance(refund_spot) == ether(2))
+    assert!(evm.balance(escrow) == Wei::zero())
+}
+
+// On a fail, the worker (the test account) tries to claim directly and
+// the payee guard rejects it, because the fail entitled the poster.
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn proxy_worker_claim_on_fail_reverts() uses (evm: mut Evm) {
+    let me = evm.address()
+    let escrow = evm.create2<VerdictEscrow>(value: Wei::zero(), args: (days(7),), salt: 0)
+    let proxy = evm.create2<PosterProxy>(value: Wei::zero(), args: (), salt: 0)
+
+    let job: u256 = evm
+        .call(
+            addr: proxy,
+            gas: 900000,
+            value: ether(1),
+            message: PosterProxyMsg::CreateJobAsPoster { escrow, worker: me, evaluator: me },
+        )
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Deliver { job_id: job, delivery_hash: 111 },
+        )
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Verdict { job_id: job, kind: 3, delivery_hash: 111 },
+        )
+    let _: Wei = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Claim { job_id: job, to: Address::new(0xCAFE) },
+        )
 }
