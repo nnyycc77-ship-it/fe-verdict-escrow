@@ -1,0 +1,291 @@
+// Verdict Escrow for Agent Work.
+//
+// One contract holds escrowed payment for agent jobs. A poster funds a job
+// and names its worker and evaluator up front. The worker records a delivery
+// hash, the evaluator records a verdict bound to that hash, and the escrow
+// settles by rule: pass entitles the worker to the escrow, fail entitles
+// the poster to a refund, revise sends the job back for a new delivery and
+// a new verdict. If the evaluator stays silent past the verdict window
+// after a delivery, the poster can reclaim the entitlement. Whoever a
+// settlement entitles collects the funds with a claim, to an address of
+// their choice. Many jobs coexist in one deployment, each with its own
+// parties, amount, delivery hash and verdict sequence.
+
+use std::evm::StorageMap
+
+// Job states. A job starts open for delivery, moves to delivered while it
+// awaits a verdict, and ends settled. Settled is terminal: no handler can
+// change a settled job. STATE_NONE is the value an unknown job id reads as.
+const STATE_NONE: u256 = 0
+const STATE_OPEN: u256 = 1
+const STATE_DELIVERED: u256 = 2
+const STATE_SETTLED: u256 = 3
+
+// Verdict kinds the evaluator can record.
+const VERDICT_PASS: u256 = 1
+const VERDICT_REVISE: u256 = 2
+const VERDICT_FAIL: u256 = 3
+
+// Settlement outcomes recorded in the Settled event.
+const OUTCOME_RELEASED: u256 = 1
+const OUTCOME_REFUNDED: u256 = 2
+const OUTCOME_RECLAIMED: u256 = 3
+
+msg VerdictEscrowMsg {
+    #[selector = sol("createJob(address,address)")]
+    CreateJob { worker: Address, evaluator: Address } -> u256,
+    #[selector = sol("deliver(uint256,uint256)")]
+    Deliver { job_id: u256, delivery_hash: u256 } -> u256,
+    #[selector = sol("verdict(uint256,uint256,uint256)")]
+    Verdict { job_id: u256, kind: u256, delivery_hash: u256 } -> u256,
+    #[selector = sol("reclaimTimeout(uint256)")]
+    ReclaimTimeout { job_id: u256 } -> Wei,
+    #[selector = sol("claim(uint256,address)")]
+    Claim { job_id: u256, to: Address } -> Wei,
+    #[selector = sol("stateOf(uint256)")]
+    StateOf { job_id: u256 } -> u256,
+    #[selector = sol("amountOf(uint256)")]
+    AmountOf { job_id: u256 } -> Wei,
+    #[selector = sol("deliveryHashOf(uint256)")]
+    DeliveryHashOf { job_id: u256 } -> u256,
+    #[selector = sol("verdictSeqOf(uint256)")]
+    VerdictSeqOf { job_id: u256 } -> u256,
+}
+
+#[event]
+struct JobCreated {
+    #[indexed]
+    job_id: u256,
+    poster: Address,
+    worker: Address,
+    evaluator: Address,
+    amount: Wei,
+}
+
+#[event]
+struct Delivered {
+    #[indexed]
+    job_id: u256,
+    delivery_hash: u256,
+}
+
+#[event]
+struct VerdictRecorded {
+    #[indexed]
+    job_id: u256,
+    kind: u256,
+    delivery_hash: u256,
+    seq: u256,
+}
+
+#[event]
+struct Settled {
+    #[indexed]
+    job_id: u256,
+    outcome: u256,
+    to: Address,
+    amount: Wei,
+}
+
+#[event]
+struct Claimed {
+    #[indexed]
+    job_id: u256,
+    to: Address,
+    amount: Wei,
+}
+
+// Everything the contract remembers about one job. The delivery hash is the
+// 256 bit digest of the delivery the worker stands behind; a verdict only
+// counts when it names this exact hash. verdict_seq counts the verdicts
+// recorded for the job and only ever increases. On settlement the verdict
+// fixes payee, the one party entitled to the escrow; paid flips to 1 when
+// the payee has collected, and nothing else about the job can change after
+// settlement.
+struct Job {
+    poster: Address,
+    worker: Address,
+    evaluator: Address,
+    amount: Wei,
+    delivery_hash: u256,
+    state: u256,
+    verdict_seq: u256,
+    delivered_at: Timestamp,
+    payee: Address,
+    paid: u256,
+}
+
+impl Copy for Job {}
+
+pub contract VerdictEscrow uses (ctx: Ctx, call: mut Call, log: mut Log) {
+    verdict_timeout: Duration,
+    mut next_job_id: u256,
+    mut jobs: StorageMap<u256, Job>,
+
+    init(timeout: Duration)
+    uses (mut verdict_timeout, mut next_job_id)
+    {
+        verdict_timeout = timeout
+        next_job_id = 1
+    }
+
+    recv VerdictEscrowMsg {
+        // The caller becomes the poster and funds the job in the same call.
+        #[payable]
+        CreateJob { worker, evaluator } -> u256 uses (ctx, mut next_job_id, mut jobs, mut log) {
+            let amount = ctx.value()
+            assert!(amount > Wei::zero(), "Escrow amount required")
+
+            let job_id = next_job_id
+            next_job_id = job_id + 1
+            jobs.set(
+                key: job_id,
+                value: Job {
+                    poster: ctx.caller(),
+                    worker,
+                    evaluator,
+                    amount,
+                    delivery_hash: 0,
+                    state: STATE_OPEN,
+                    verdict_seq: 0,
+                    delivered_at: ctx.timestamp(),
+                    payee: Address::new(0),
+                    paid: 0,
+                },
+            )
+            log.emit(
+                JobCreated { job_id, poster: ctx.caller(), worker, evaluator, amount },
+            )
+            job_id
+        }
+
+        // Only the job's worker can record a delivery, and only while the
+        // job is open: before the first verdict, or again after a revise.
+        Deliver { job_id, delivery_hash } -> u256
+        uses (ctx, mut jobs, mut log)
+        {
+            var job = jobs.get(key: job_id)
+            assert!(job.state == STATE_OPEN, "Job is not open for delivery")
+            assert!(ctx.caller() == job.worker, "Only the worker can deliver")
+            assert!(delivery_hash != 0, "Delivery hash required")
+
+            job.delivery_hash = delivery_hash
+            job.delivered_at = ctx.timestamp()
+            job.state = STATE_DELIVERED
+            jobs.set(key: job_id, value: job)
+            log.emit(Delivered { job_id, delivery_hash })
+            delivery_hash
+        }
+
+        // Only the job's evaluator can record a verdict, and only against
+        // the delivery hash currently on record. Pass and fail settle the
+        // job in this call and fix who is entitled to the escrow: the
+        // worker on a pass, the poster on a fail. The entitled party then
+        // collects with Claim. Revise reopens the job for a new delivery
+        // while the funds stay in escrow.
+        Verdict { job_id, kind, delivery_hash } -> u256
+        uses (ctx, mut jobs, mut log)
+        {
+            var job = jobs.get(key: job_id)
+            assert!(job.state == STATE_DELIVERED, "Job has no live delivery")
+            assert!(
+                ctx.caller() == job.evaluator,
+                "Only the evaluator can record a verdict",
+            )
+            assert!(
+                delivery_hash == job.delivery_hash,
+                "Verdict is not bound to the current delivery",
+            )
+            assert!(
+                kind == VERDICT_PASS || kind == VERDICT_REVISE || kind == VERDICT_FAIL,
+                "Unknown verdict kind",
+            )
+
+            job.verdict_seq = job.verdict_seq + 1
+            let seq = job.verdict_seq
+            log.emit(VerdictRecorded { job_id, kind, delivery_hash, seq })
+
+            if kind == VERDICT_REVISE {
+                job.state = STATE_OPEN
+                jobs.set(key: job_id, value: job)
+            } else {
+                let amount = job.amount
+                let to = if kind == VERDICT_PASS {
+                    job.worker
+                } else {
+                    job.poster
+                }
+                let outcome = if kind == VERDICT_PASS {
+                    OUTCOME_RELEASED
+                } else {
+                    OUTCOME_REFUNDED
+                }
+                job.state = STATE_SETTLED
+                job.payee = to
+                jobs.set(key: job_id, value: job)
+                log.emit(Settled { job_id, outcome, to, amount })
+            }
+            seq
+        }
+
+        // If no verdict arrives within the verdict window after a delivery,
+        // the poster can reclaim the escrow: the job settles with the poster
+        // as the entitled party, and the poster collects with Claim. Only
+        // the poster, only while a delivery is still waiting for a verdict.
+        ReclaimTimeout { job_id } -> Wei uses (ctx, verdict_timeout, mut jobs, mut log) {
+            var job = jobs.get(key: job_id)
+            assert!(job.state == STATE_DELIVERED, "Job has no live delivery")
+            assert!(ctx.caller() == job.poster, "Only the poster can reclaim")
+            assert!(
+                ctx.timestamp() >= job.delivered_at + verdict_timeout,
+                "Verdict window still open",
+            )
+
+            let amount = job.amount
+            job.state = STATE_SETTLED
+            job.payee = job.poster
+            jobs.set(key: job_id, value: job)
+            log.emit(
+                Settled { job_id, outcome: OUTCOME_RECLAIMED, to: job.poster, amount },
+            )
+            amount
+        }
+
+        // The party a settlement named as payee collects the escrow, to an
+        // address of their choice. This is the only handler that moves
+        // funds, and the job is marked paid before the send, so a reentrant
+        // call finds nothing left to claim.
+        Claim { job_id, to } -> Wei uses (ctx, mut call, mut jobs, mut log) {
+            var job = jobs.get(key: job_id)
+            assert!(job.state == STATE_SETTLED, "Job is not settled")
+            assert!(ctx.caller() == job.payee, "Only the payee can claim")
+            assert!(job.paid == 0, "Escrow already claimed")
+
+            let amount = job.amount
+            job.paid = 1
+            jobs.set(key: job_id, value: job)
+            assert!(
+                call.send_value(addr: to, gas: 0, value: amount).success(),
+                "Payout failed",
+            )
+            log.emit(Claimed { job_id, to, amount })
+            amount
+        }
+
+        StateOf { job_id } -> u256 uses (jobs) {
+            jobs.get(key: job_id).state
+        }
+
+        AmountOf { job_id } -> Wei uses (jobs) {
+            jobs.get(key: job_id).amount
+        }
+
+        DeliveryHashOf { job_id } -> u256 uses (jobs) {
+            jobs.get(key: job_id).delivery_hash
+        }
+
+        VerdictSeqOf { job_id } -> u256 uses (jobs) {
+            jobs.get(key: job_id).verdict_seq
+        }
+    }
+}

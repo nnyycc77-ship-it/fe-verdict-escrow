@@ -1,0 +1,554 @@
+// Run the tests with `fe test`.
+//
+// The Fe test harness sends every call from the test account, so in the
+// happy path tests the test account plays poster, worker and evaluator at
+// once. Settlements are collected with Claim to a fresh address, and the
+// payout is checked there and in the contract balance. Role separation is
+// covered by the revert tests, where the job names a different worker or
+// evaluator and the test account's call must fail the guard.
+//
+// Verdict kinds: 1 is pass, 2 is revise, 3 is fail.
+// Job states: 1 is open for delivery, 2 is delivered, 3 is settled.
+
+use ingot::{VerdictEscrow, VerdictEscrowMsg}
+use std::evm::{days, ether}
+
+#[test(balance = 10_000_000_000_000_000_000)]
+fn pass_releases_to_worker() uses (evm: mut Evm) {
+    let me = evm.address()
+    let escrow = evm.create2<VerdictEscrow>(value: Wei::zero(), args: (days(7),), salt: 0)
+
+    let job: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: ether(1),
+            message: VerdictEscrowMsg::CreateJob { worker: me, evaluator: me },
+        )
+    assert!(job == 1)
+    assert!(evm.balance(escrow) == ether(1))
+
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Deliver { job_id: job, delivery_hash: 111 },
+        )
+    let seq: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Verdict { job_id: job, kind: 1, delivery_hash: 111 },
+        )
+    assert!(seq == 1)
+
+    let state: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 100000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::StateOf { job_id: job },
+        )
+    assert!(state == 3)
+
+    // The pass entitles the worker, who collects to a fresh address.
+    let payee = Address::new(0xCAFE)
+    let claimed: Wei = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Claim { job_id: job, to: payee },
+        )
+    assert!(claimed == ether(1))
+    assert!(evm.balance(payee) == ether(1))
+    assert!(evm.balance(escrow) == Wei::zero())
+    assert!(evm.balance(me) == ether(9))
+}
+
+#[test(balance = 10_000_000_000_000_000_000)]
+fn fail_refunds_poster() uses (evm: mut Evm) {
+    let me = evm.address()
+    let escrow = evm.create2<VerdictEscrow>(value: Wei::zero(), args: (days(7),), salt: 0)
+
+    let job: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: ether(2),
+            message: VerdictEscrowMsg::CreateJob { worker: me, evaluator: me },
+        )
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Deliver { job_id: job, delivery_hash: 222 },
+        )
+    let seq: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Verdict { job_id: job, kind: 3, delivery_hash: 222 },
+        )
+    assert!(seq == 1)
+
+    let state: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 100000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::StateOf { job_id: job },
+        )
+    assert!(state == 3)
+
+    // The fail entitles the poster, who collects the refund.
+    let payee = Address::new(0xCAFE)
+    let claimed: Wei = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Claim { job_id: job, to: payee },
+        )
+    assert!(claimed == ether(2))
+    assert!(evm.balance(payee) == ether(2))
+    assert!(evm.balance(escrow) == Wei::zero())
+    assert!(evm.balance(me) == ether(8))
+}
+
+#[test(balance = 10_000_000_000_000_000_000)]
+fn revise_then_second_delivery_pass_releases() uses (evm: mut Evm) {
+    let me = evm.address()
+    let escrow = evm.create2<VerdictEscrow>(value: Wei::zero(), args: (days(7),), salt: 0)
+
+    let job: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: ether(1),
+            message: VerdictEscrowMsg::CreateJob { worker: me, evaluator: me },
+        )
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Deliver { job_id: job, delivery_hash: 111 },
+        )
+    let seq: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Verdict { job_id: job, kind: 2, delivery_hash: 111 },
+        )
+    assert!(seq == 1)
+
+    // Revise holds the funds and reopens the job for a new delivery.
+    let state: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 100000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::StateOf { job_id: job },
+        )
+    assert!(state == 1)
+    assert!(evm.balance(escrow) == ether(1))
+
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Deliver { job_id: job, delivery_hash: 222 },
+        )
+    let stored: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 100000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::DeliveryHashOf { job_id: job },
+        )
+    assert!(stored == 222)
+
+    let seq2: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Verdict { job_id: job, kind: 1, delivery_hash: 222 },
+        )
+    // The per job sequence only increases across verdict rounds.
+    assert!(seq2 == 2)
+    let final_seq: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 100000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::VerdictSeqOf { job_id: job },
+        )
+    assert!(final_seq == 2)
+
+    let payee = Address::new(0xCAFE)
+    let claimed: Wei = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Claim { job_id: job, to: payee },
+        )
+    assert!(claimed == ether(1))
+    assert!(evm.balance(payee) == ether(1))
+    assert!(evm.balance(escrow) == Wei::zero())
+}
+
+#[test(balance = 10_000_000_000_000_000_000)]
+fn silence_timeout_lets_poster_reclaim() uses (evm: mut Evm) {
+    let me = evm.address()
+    // A zero verdict window means the window has always already passed, so
+    // the timeout path can be exercised without moving the clock.
+    let escrow = evm.create2<VerdictEscrow>(value: Wei::zero(), args: (Duration::zero(),), salt: 0)
+
+    let job: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: ether(1),
+            message: VerdictEscrowMsg::CreateJob { worker: me, evaluator: me },
+        )
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Deliver { job_id: job, delivery_hash: 111 },
+        )
+    let reclaimed: Wei = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::ReclaimTimeout { job_id: job },
+        )
+    assert!(reclaimed == ether(1))
+
+    let state: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 100000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::StateOf { job_id: job },
+        )
+    assert!(state == 3)
+
+    // The reclaim entitles the poster, who collects the funds back.
+    let payee = Address::new(0xCAFE)
+    let claimed: Wei = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Claim { job_id: job, to: payee },
+        )
+    assert!(claimed == ether(1))
+    assert!(evm.balance(payee) == ether(1))
+    assert!(evm.balance(escrow) == Wei::zero())
+    assert!(evm.balance(me) == ether(9))
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn reclaim_before_timeout_reverts() uses (evm: mut Evm) {
+    let me = evm.address()
+    let escrow = evm.create2<VerdictEscrow>(value: Wei::zero(), args: (days(7),), salt: 0)
+
+    let job: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: ether(1),
+            message: VerdictEscrowMsg::CreateJob { worker: me, evaluator: me },
+        )
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Deliver { job_id: job, delivery_hash: 111 },
+        )
+    // The seven day verdict window is still open, so this must revert.
+    let _: Wei = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::ReclaimTimeout { job_id: job },
+        )
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn verdict_from_non_evaluator_reverts() uses (evm: mut Evm) {
+    let me = evm.address()
+    let escrow = evm.create2<VerdictEscrow>(value: Wei::zero(), args: (days(7),), salt: 0)
+
+    let job: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: ether(1),
+            message: VerdictEscrowMsg::CreateJob { worker: me, evaluator: Address::new(0xE001) },
+        )
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Deliver { job_id: job, delivery_hash: 111 },
+        )
+    // The caller is the worker and poster, but not the evaluator.
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Verdict { job_id: job, kind: 1, delivery_hash: 111 },
+        )
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn delivery_from_non_worker_reverts() uses (evm: mut Evm) {
+    let me = evm.address()
+    let escrow = evm.create2<VerdictEscrow>(value: Wei::zero(), args: (days(7),), salt: 0)
+
+    let job: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: ether(1),
+            message: VerdictEscrowMsg::CreateJob { worker: Address::new(0xB001), evaluator: me },
+        )
+    // The caller funded the job, but the named worker is someone else.
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Deliver { job_id: job, delivery_hash: 111 },
+        )
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn second_verdict_after_settlement_reverts() uses (evm: mut Evm) {
+    let me = evm.address()
+    let escrow = evm.create2<VerdictEscrow>(value: Wei::zero(), args: (days(7),), salt: 0)
+
+    let job: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: ether(1),
+            message: VerdictEscrowMsg::CreateJob { worker: me, evaluator: me },
+        )
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Deliver { job_id: job, delivery_hash: 111 },
+        )
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Verdict { job_id: job, kind: 1, delivery_hash: 111 },
+        )
+    // The job is settled, so no further verdict can be recorded.
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Verdict { job_id: job, kind: 3, delivery_hash: 111 },
+        )
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn second_claim_reverts() uses (evm: mut Evm) {
+    let me = evm.address()
+    let escrow = evm.create2<VerdictEscrow>(value: Wei::zero(), args: (days(7),), salt: 0)
+
+    let job: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: ether(1),
+            message: VerdictEscrowMsg::CreateJob { worker: me, evaluator: me },
+        )
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Deliver { job_id: job, delivery_hash: 111 },
+        )
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Verdict { job_id: job, kind: 1, delivery_hash: 111 },
+        )
+    let _: Wei = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Claim { job_id: job, to: Address::new(0xCAFE) },
+        )
+    // The escrow for this job has already been collected.
+    let _: Wei = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Claim { job_id: job, to: Address::new(0xCAFE) },
+        )
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn verdict_with_wrong_hash_reverts() uses (evm: mut Evm) {
+    let me = evm.address()
+    let escrow = evm.create2<VerdictEscrow>(value: Wei::zero(), args: (days(7),), salt: 0)
+
+    let job: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: ether(1),
+            message: VerdictEscrowMsg::CreateJob { worker: me, evaluator: me },
+        )
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Deliver { job_id: job, delivery_hash: 111 },
+        )
+    // The verdict names a hash that is not the delivery on record.
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Verdict { job_id: job, kind: 1, delivery_hash: 999 },
+        )
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn verdict_before_delivery_reverts() uses (evm: mut Evm) {
+    let me = evm.address()
+    let escrow = evm.create2<VerdictEscrow>(value: Wei::zero(), args: (days(7),), salt: 0)
+
+    let job: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: ether(1),
+            message: VerdictEscrowMsg::CreateJob { worker: me, evaluator: me },
+        )
+    // Nothing has been delivered, so there is nothing to judge.
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Verdict { job_id: job, kind: 1, delivery_hash: 111 },
+        )
+}
+
+#[test(balance = 10_000_000_000_000_000_000)]
+fn jobs_are_independent() uses (evm: mut Evm) {
+    let me = evm.address()
+    let escrow = evm.create2<VerdictEscrow>(value: Wei::zero(), args: (days(7),), salt: 0)
+
+    let job_a: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: ether(1),
+            message: VerdictEscrowMsg::CreateJob { worker: me, evaluator: me },
+        )
+    let job_b: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: ether(2),
+            message: VerdictEscrowMsg::CreateJob { worker: me, evaluator: me },
+        )
+    assert!(job_a == 1)
+    assert!(job_b == 2)
+    assert!(evm.balance(escrow) == ether(3))
+
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Deliver { job_id: job_a, delivery_hash: 111 },
+        )
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Deliver { job_id: job_b, delivery_hash: 222 },
+        )
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Verdict { job_id: job_a, kind: 1, delivery_hash: 111 },
+        )
+    let payee = Address::new(0xCAFE)
+    let claimed: Wei = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Claim { job_id: job_a, to: payee },
+        )
+    assert!(claimed == ether(1))
+    assert!(evm.balance(payee) == ether(1))
+
+    // Settling and paying job A leaves job B funded, delivered and unjudged.
+    let state_b: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 100000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::StateOf { job_id: job_b },
+        )
+    assert!(state_b == 2)
+    let amount_b: Wei = evm
+        .call(
+            addr: escrow,
+            gas: 100000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::AmountOf { job_id: job_b },
+        )
+    assert!(amount_b == ether(2))
+    let seq_b: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 100000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::VerdictSeqOf { job_id: job_b },
+        )
+    assert!(seq_b == 0)
+    assert!(evm.balance(escrow) == ether(2))
+}
