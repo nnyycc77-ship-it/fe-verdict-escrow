@@ -1,0 +1,41 @@
+# Builds the contract and runs the test suite with the exact Fe release
+# named in the README, on every push and pull request.
+name: build-and-test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FE_VERSION: v26.6.0
+  # SHA-256 of the fe_linux_amd64 asset of the release above.
+  FE_SHA256: 697081cb9265bd1be7a5d33e6bb0c8559ee5ff542abab9a046540fc151b4edaa
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Fe
+        run: |
+          mkdir -p "$HOME/.fe/bin"
+          curl -fsSL -o "$HOME/.fe/bin/fe" \
+            "https://github.com/argotorg/fe/releases/download/${FE_VERSION}/fe_linux_amd64"
+          echo "${FE_SHA256}  $HOME/.fe/bin/fe" | sha256sum --check
+          chmod +x "$HOME/.fe/bin/fe"
+          echo "$HOME/.fe/bin" >> "$GITHUB_PATH"
+
+      - name: Fe version
+        run: fe --version
+
+      - name: Build
+        run: fe build
+
+      - name: Test
+        run: fe test
