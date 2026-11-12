@@ -422,6 +422,50 @@ fn second_claim_reverts() uses (evm: mut Evm) {
         )
 }
 
+// Documentation test for the receiver finding written up in FRICTION.md.
+// A runtime compiled with this toolchain answers only calls that carry a
+// message selector, so it refuses a plain value transfer with empty
+// calldata at any forwarded gas. Here the entitled worker names a
+// deployed Fe contract (the PosterProxy) as the claim target: the send
+// inside Claim fails, the assert on it fires, and the whole claim
+// reverts, leaving the escrow unpaid and claimable again to an address
+// that can receive.
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn claim_to_fe_contract_reverts() uses (evm: mut Evm) {
+    let me = evm.address()
+    let escrow = evm.create2<VerdictEscrow>(value: Wei::zero(), args: (days(7),), salt: 0)
+    let proxy = evm.create2<PosterProxy>(value: Wei::zero(), args: (), salt: 0)
+
+    let job: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: ether(1),
+            message: VerdictEscrowMsg::CreateJob { worker: me, evaluator: me },
+        )
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 200000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Deliver { job_id: job, delivery_hash: 111 },
+        )
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Verdict { job_id: job, kind: 1, delivery_hash: 111 },
+        )
+    let _: Wei = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: VerdictEscrowMsg::Claim { job_id: job, to: proxy },
+        )
+}
+
 #[test(should_revert, balance = 10_000_000_000_000_000_000)]
 fn verdict_with_wrong_hash_reverts() uses (evm: mut Evm) {
     let me = evm.address()

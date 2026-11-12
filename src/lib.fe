@@ -98,15 +98,22 @@ struct Claimed {
     amount: Wei,
 }
 
-// Everything the contract remembers about one job. The delivery hash is the
-// 256 bit digest of the delivery the worker stands behind; a verdict only
-// counts when it names this exact hash. verdict_seq counts the verdicts
-// recorded for the job and only ever increases. last_move_at is the time
-// of the job's last move (creation, a delivery, or a revise verdict) and
-// starts the clock for the poster's reclaim. On settlement the verdict
-// fixes payee, the one party entitled to the escrow; paid flips to 1 when
-// the payee has collected, and nothing else about the job can change after
-// settlement.
+// The core record of one job. The delivery hash is the 256 bit digest of
+// the delivery the worker stands behind; a verdict only counts when it
+// names this exact hash. verdict_seq counts the verdicts recorded for the
+// job and only ever increases. last_move_at is the time of the job's last
+// move (creation, a delivery, or a revise verdict) and starts the clock
+// for the poster's reclaim.
+//
+// Storage is split into three maps by privilege, so the compiler checks
+// who may write what. The core record above is written by the handlers
+// that run the job's life: create, deliver, verdict, and reclaim. The
+// entitlements map holds the one party a settlement entitles to the
+// escrow, and only the verdict and reclaim handlers may write it: they
+// are the only handlers that declare it mutable. The payments map holds
+// the paid flag, and only the claim handler may write it. The claim
+// handler declares the core record and the entitlements read only, so it
+// can collect on a settlement but can never change one.
 struct Job {
     poster: Address,
     worker: Address,
@@ -116,8 +123,6 @@ struct Job {
     state: u256,
     verdict_seq: u256,
     last_move_at: Timestamp,
-    payee: Address,
-    paid: u256,
 }
 
 impl Copy for Job {}
@@ -126,6 +131,8 @@ pub contract VerdictEscrow uses (ctx: Ctx, call: mut Call, log: mut Log) {
     verdict_timeout: Duration,
     mut next_job_id: u256,
     mut jobs: StorageMap<u256, Job>,
+    mut entitlements: StorageMap<u256, Address>,
+    mut payments: StorageMap<u256, u256>,
 
     init(timeout: Duration)
     uses (mut verdict_timeout, mut next_job_id)
@@ -154,8 +161,6 @@ pub contract VerdictEscrow uses (ctx: Ctx, call: mut Call, log: mut Log) {
                     state: STATE_OPEN,
                     verdict_seq: 0,
                     last_move_at: ctx.timestamp(),
-                    payee: Address::new(0),
-                    paid: 0,
                 },
             )
             log.emit(
@@ -189,7 +194,7 @@ pub contract VerdictEscrow uses (ctx: Ctx, call: mut Call, log: mut Log) {
         // collects with Claim. Revise reopens the job for a new delivery
         // while the funds stay in escrow.
         Verdict { job_id, kind, delivery_hash } -> u256
-        uses (ctx, mut jobs, mut log)
+        uses (ctx, mut jobs, mut entitlements, mut log)
         {
             var job = jobs.get(key: job_id)
             assert!(job.state == STATE_DELIVERED, "Job has no live delivery")
@@ -227,8 +232,8 @@ pub contract VerdictEscrow uses (ctx: Ctx, call: mut Call, log: mut Log) {
                     OUTCOME_REFUNDED
                 }
                 job.state = STATE_SETTLED
-                job.payee = to
                 jobs.set(key: job_id, value: job)
+                entitlements.set(key: job_id, value: to)
                 log.emit(Settled { job_id, outcome, to, amount })
             }
             seq
@@ -242,7 +247,13 @@ pub contract VerdictEscrow uses (ctx: Ctx, call: mut Call, log: mut Log) {
         // unsettled, so every round carries its own deadline: a worker
         // who never delivers, a worker who abandons after a revise, and
         // an evaluator who stays silent all leave the poster this exit.
-        ReclaimTimeout { job_id } -> Wei uses (ctx, verdict_timeout, mut jobs, mut log) {
+        ReclaimTimeout { job_id } -> Wei uses (
+            ctx,
+            verdict_timeout,
+            mut jobs,
+            mut entitlements,
+            mut log,
+        ) {
             var job = jobs.get(key: job_id)
             assert!(
                 job.state == STATE_OPEN || job.state == STATE_DELIVERED,
@@ -256,8 +267,8 @@ pub contract VerdictEscrow uses (ctx: Ctx, call: mut Call, log: mut Log) {
 
             let amount = job.amount
             job.state = STATE_SETTLED
-            job.payee = job.poster
             jobs.set(key: job_id, value: job)
+            entitlements.set(key: job_id, value: job.poster)
             log.emit(
                 Settled { job_id, outcome: OUTCOME_RECLAIMED, to: job.poster, amount },
             )
@@ -269,16 +280,28 @@ pub contract VerdictEscrow uses (ctx: Ctx, call: mut Call, log: mut Log) {
         // funds, and the job is marked paid before the send, so a reentrant
         // call finds nothing left to claim. The send forwards 100,000 gas,
         // well beyond the bare transfer stipend, so a contract payee whose
-        // receive path does work can still be paid.
-        Claim { job_id, to } -> Wei uses (ctx, mut call, mut jobs, mut log) {
-            var job = jobs.get(key: job_id)
+        // receive path does work can still be paid. The handler declares
+        // the core record and the entitlements read only: it can read who
+        // is entitled and how much, and the only storage it writes is its
+        // own paid flag, so a claim can never change a settlement.
+        Claim { job_id, to } -> Wei uses (
+            ctx,
+            mut call,
+            jobs,
+            entitlements,
+            mut payments,
+            mut log,
+        ) {
+            let job = jobs.get(key: job_id)
             assert!(job.state == STATE_SETTLED, "Job is not settled")
-            assert!(ctx.caller() == job.payee, "Only the payee can claim")
-            assert!(job.paid == 0, "Escrow already claimed")
+            assert!(
+                ctx.caller() == entitlements.get(key: job_id),
+                "Only the payee can claim",
+            )
+            assert!(payments.get(key: job_id) == 0, "Escrow already claimed")
 
             let amount = job.amount
-            job.paid = 1
-            jobs.set(key: job_id, value: job)
+            payments.set(key: job_id, value: 1)
             assert!(
                 call.send_value(addr: to, gas: 100000, value: amount).success(),
                 "Payout failed",
